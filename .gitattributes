@@ -1,0 +1,9 @@
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+# Keep launcher CRLF bytes in Git blobs and ZIP downloads.
+*.bat -text whitespace=cr-at-eol
+# Preserve third-party model and charset bytes exactly.
+*.onnx binary
+models/charsets.txt -text

@@ -1,0 +1,30 @@
+{
+  "note": "Extracted frontend methods executed in an offline sandbox. Dummy IDs; no network requests sent.",
+  "requests": [
+    {
+      "url": "createQrcode",
+      "method": "post",
+      "data": {
+        "component_key": "PaymentOrder_11",
+        "app_id": 616,
+        "bpmn_id": 3886,
+        "goods_id": 1,
+        "pay_money": 20,
+        "params": "{\"inst_id\":{\"value\":\"\",\"component_key\":\"$EVN.url_inst id\",\"is_show\":false},\"reserve_id\":{\"value\":\"123456\",\"component_key\":\"$EVN.url_reserve_id\",\"is_show\":false}}",
+        "form_id": 1645,
+        "url": "",
+        "notify_action": "1",
+        "url_type": 0,
+        "appointment_id": "123456"
+      }
+    },
+    {
+      "url": "simulation",
+      "method": "post",
+      "data": {
+        "id": 999999,
+        "data": "{\"app_id\":\"616\",\"node_id\":\"\",\"form_data\":{\"1645\":{\"Input_7\":\"1号场, 2026-10-30 19:10-20:10\",\"Input_14\":\"2026-10-30 19:10-20:10\",\"PaymentOrder_11\":{\"status\":0,\"id\":999999,\"goods_id\":1,\"pay_money\":20,\"params\":\"{\\\"reserve_id\\\":\\\"123456\\\"}\"}}}}"
+      }
+    }
+  ]
+}
