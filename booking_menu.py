@@ -1,6 +1,7 @@
 """Interactive, read-only choices; only a confirmed plan reaches auto.main."""
 from datetime import datetime, timedelta
 from decimal import Decimal
+from run_diagnostics import record, session
 
 from auto_grab import BASE, load_cookie
 from booking_catalog import (allowed_dates, china_now, get_calendar, get_halls,
@@ -24,7 +25,7 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
     def pick(title, labels, *, zero=False):
         output("\n" + title)
         if zero:
-            output("  0. 不限场地（默认，回车直接选择；多段必须同一块）")
+            output("  0. 不限场地（默认，回车直接选择）")
         for index, label in enumerate(labels, 1):
             output(f"  {index}. {label}")
         while True:
@@ -45,7 +46,7 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
         venues = hall["resources"]
         venue = venues[pick("选择场馆", [v["name"] for v in venues])]
         info = get_resource_info(cookie, int(venue["id"]))
-        output(f"单次最多 {selection_limit(info)} 段；多段须连续且同场地。")
+        output(f"单次最多 {selection_limit(info)} 段；多段须连续，不会自动减少时段。")
         days = allowed_dates(info, now)
         calendars = {}
         today = now.date().isoformat()
@@ -91,7 +92,7 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
                          if times[i].split("-")[1] == times[i + 1].split("-")[0]), None)
             if pair is not None:
                 output(f"多段示例：输入 {pair+1},{pair+2}，同时预约 {times[pair]} 和 {times[pair+1]}")
-            output("多段编号用逗号分隔，须连续且同一块场地，不会自动减少时段。")
+            output("多段编号用逗号分隔，须连续；场地是否允许变更将在后面选择。")
         while True:
             try:
                 indexes = [int(s.strip()) - 1 for s in ask("时段编号：").replace("，", ",").split(",")]
@@ -105,12 +106,27 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
         matching = [s for s in cells if s["time"] in selected]
         court_sets = [{s["court"] for s in matching if s["time"] == time} for time in selected]
         courts = sorted(set.intersection(*court_sets))
-        if not courts:
-            raise RuntimeError("所选时段没有共同场地，请重新运行选择")
         court = ""
+        allow_court_change = False
         if courts != [""]:
+            if not courts:
+                output("所选时段没有共同场地，可选择不限场地并允许换场。")
             chosen = pick("选择场地", courts, zero=True)
             court = courts[chosen] if chosen >= 0 else ""
+            if not court and len(selected) > 1:
+                output("\n连续时段的场地安排")
+                output("  1. 优先同场；没有同场组合时允许换场（默认）")
+                output("  2. 必须同一块场地")
+                while True:
+                    policy = ask("场地安排 [回车=1]：") or "1"
+                    if policy not in ("1", "2"):
+                        output("编号无效，请重新选择")
+                        continue
+                    if policy == "2" and not courts:
+                        output("这些时段没有共同场地，请允许换场或输入 q 退出。")
+                        continue
+                    allow_court_change = policy == "1"
+                    break
         candidates = [s for s in matching if not court or s["court"] == court]
         prices = [[Decimal(str(s["price"])) for s in candidates if s["time"] == time
                    and s.get("price") is not None] for time in selected]
@@ -126,10 +142,16 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
         mode = pick("选择启动方式", modes)
         args = ["--venue", str(venue["id"]), "--date", day, "--times", ";".join(selected)]
         args += ["--court", court] if court else []
+        args += ["--allow-court-change"] if allow_court_change else []
         args += ["--at", release] if mode == 1 else ["--now"]
         output("\n请确认预约清单：")
         output(f"项目：{hall['name']} / {info['name']}\n日期：{day}\n时段：{'、'.join(selected)}")
-        output(f"场地：{court or ('无须选择场地' if courts == [''] else '不限场号，多段同一块场地')}")
+        arrangement = ("优先同场；没有同场组合时允许换场，所选时段全部预约" if allow_court_change
+                       else ("无须选择场地" if courts == [""] else
+                             ("不限场号，必须同一块场地" if len(selected) > 1 else "不限场号")))
+        output(f"场地：{court or arrangement}")
+        if allow_court_change:
+            output("跨场组合会一次提交，以学校实际受理为准；不自动拆单，回执不完整时停止。")
         output(f"费用：{fee}；最终以预约回执为准，免费不创建支付订单")
         output(f"方式：{modes[mode]}")
         if ask("确认后将可能创建真实预约。输入 yes 确认，其他输入取消：").lower() != "yes":
@@ -145,7 +167,7 @@ def datetime_start(day, slot):
     return datetime.fromisoformat(day + "T" + parse_times(slot)[0].split("-")[0])
 
 
-def main() -> int:
+def _main() -> int:
     cookie = load_cookie()
     if not cookie:
         print("没有登录凭据，请先运行 python cdp_cookie.py --wait 完成人工登录")
@@ -166,6 +188,13 @@ def main() -> int:
     except (Exception, KeyboardInterrupt) as exc:
         print(f"[×] 预约流程中断：{exc}；请先在网页核对预约和订单，避免重复提交")
         return 1
+
+
+def main() -> int:
+    with session():
+        result = _main()
+        record("result", exit_code=result)
+        return result
 
 
 if __name__ == "__main__":

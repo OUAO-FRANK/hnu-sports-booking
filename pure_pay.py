@@ -7,6 +7,8 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Thread
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -18,17 +20,22 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "tools"))
 
 from auto_grab import _req, load_cookie, require_success  # noqa: E402
+from run_diagnostics import record
 
 APP_ID = 616
 COMPONENT = "PaymentOrder_11"
+
+
+class PaymentPreparationError(RuntimeError):
+    """This invocation failed before sending any create-order request."""
 
 
 def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _get(cookie: str, path: str, params: dict) -> dict:
-    response = _req(path, cookie=cookie, params=params, timeout=5)
+def _get(cookie: str, path: str, params: dict, *, timeout=5) -> dict:
+    response = _req(path, cookie=cookie, params=params, timeout=timeout)
     require_success(response)
     return response["d"]
 
@@ -68,28 +75,35 @@ def _amount(value) -> Decimal:
     raise RuntimeError("服务端预约金额无效，不创建订单")
 
 
-def _period(row: dict, now: datetime) -> tuple[str, str, str]:
+def _period(row: dict, now: datetime) -> tuple[str, str, str, tuple]:
     if str(row.get("status")) != "6":
         raise RuntimeError("预约不是有效待支付状态，不创建订单")
     periods = row.get("period_text")
-    if not isinstance(periods, dict) or len(periods) != 1:
-        raise RuntimeError("仅支持一条明确的预约场次")
-    period = next(iter(periods.values()))
-    if not isinstance(period.get("text"), list) or not period["text"]:
-        raise RuntimeError("缺少明确的预约时段")
-    day, court = period["date"], period["sub_name"].strip()
-    slots = sorted(text.strip() for text in period["text"])
+    if not isinstance(periods, dict) or not periods:
+        raise RuntimeError("缺少明确的预约场次")
     intervals = []
-    for slot in slots:
-        start, end = (datetime.fromisoformat(day + "T" + clock) for clock in slot.split("-"))
-        if start <= now:
-            raise RuntimeError("预约场次已开场，不创建订单")
-        if end <= start:
-            raise RuntimeError("预约时段无效")
-        intervals.append((start, end))
+    for period in periods.values():
+        if not isinstance(period, dict) or not isinstance(period.get("text"), list) or not period["text"]:
+            raise RuntimeError("缺少明确的预约时段")
+        day, court = period["date"], period["sub_name"].strip()
+        for text in period["text"]:
+            slot = text.strip()
+            start, end = (datetime.fromisoformat(day + "T" + clock) for clock in slot.split("-"))
+            if start <= now:
+                raise RuntimeError("预约场次已开场，不创建订单")
+            if end <= start:
+                raise RuntimeError("预约时段无效")
+            intervals.append((start, end, day, court, slot))
+    intervals.sort(key=lambda interval: interval[0])
+    day = intervals[0][2]
+    if any(interval[2] != day for interval in intervals):
+        raise RuntimeError("多段预约必须在同一天")
     if any(previous[1] != current[0] for previous, current in zip(intervals, intervals[1:])):
         raise RuntimeError("多段预约时间不连续")
-    return day, court, "; ".join(slots)
+    courts = [interval[3] for interval in intervals]
+    court = courts[0] if len(set(courts)) == 1 else " → ".join(courts)
+    identity = tuple((interval[2], interval[3], interval[4]) for interval in intervals)
+    return day, court, "; ".join(interval[4] for interval in intervals), identity
 
 
 def _component_config(plugins, key: str) -> dict:
@@ -123,7 +137,7 @@ def _payment_config(plugins) -> dict:
     return config
 
 
-def _canonical_labels(cookie: str, reservation: dict, form: dict) -> tuple[str, str]:
+def _canonical_labels(cookie: str, reservation: dict, form: dict, *, deadline=None) -> tuple[str, str]:
     """双时段文案沿用前端的只读数据源，避免猜测合并格式。"""
     source = _component_config(form["plugins"], "DataSource_12")
     mapping = source.get("mapConfig") or {}
@@ -134,13 +148,37 @@ def _canonical_labels(cookie: str, reservation: dict, form: dict) -> tuple[str, 
             or [(item.get("key"), item.get("type"), item.get("value"))
                 for item in source.get("conditions", [])] != [("id", 0, "$EVN.url_reserve_id")]):
         raise RuntimeError("预约支付数据源配置已变化")
-    response = _req("/site/data-source/detail", cookie=cookie, form={
+    payload = {
         "id": source["sourceid"], "inst_id": 0, "app_id": APP_ID,
         "form_version_id": form["form_version_id"], "component": "DataSource_12",
         "params[formId]": form["id"], "params[pluginKey]": "DataSource_12",
         "params[id]": reservation["id"],
-    })
-    require_success(response)
+    }
+    read_deadline = time.monotonic() + 10
+    if deadline is not None:
+        read_deadline = min(read_deadline, deadline)
+    for attempt in range(2):
+        remaining = read_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("支付资料读取预算已用完")
+        started = time.perf_counter()
+        response = _req("/site/data-source/detail", cookie=cookie, form=payload, timeout=min(5, remaining))
+        code = str(response.get("e"))
+        record("timing", stage="payment_labels_read", attempt=attempt + 1,
+               code=code if code in ("0", "EXC", "408", "429", "500", "502", "503", "504", "10042", "10043") else "OTHER",
+               duration_ms=round((time.perf_counter() - started) * 1000, 1))
+        transient = (code in ("408", "500", "502", "503", "504")
+                     or (code == "EXC" and str(response.get("m")) in (
+                         "ReadTimeoutError", "ConnectTimeoutError", "NewConnectionError",
+                         "ProxyError", "ProtocolError", "TimeoutError", "ConnectionResetError")))
+        if (attempt == 0 and transient
+                and read_deadline - time.monotonic() > .3):
+            time.sleep(.3)
+            continue
+        require_success(response)
+        if time.monotonic() >= read_deadline:
+            raise RuntimeError("支付资料读取预算已用完")
+        break
     data = (response.get("d") or {}).get("list") or {}
     if (str(data.get("id")) != str(reservation["id"])
             or str(data.get("resource_id")) != str(reservation["resource_id"])
@@ -150,38 +188,105 @@ def _canonical_labels(cookie: str, reservation: dict, form: dict) -> tuple[str, 
     return data["time"], data["name"]
 
 
-def prepare_payment(cookie: str, rid: int, *, now: datetime | None = None) -> dict:
-    """只读核对有效预约与现行表单，不创建订单。"""
-    now = now or datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
-    reservation = _detail(cookie, rid)
-    day, court, slot = _period(reservation, now)
-    amount = _amount(reservation.get("pay_money"))
-    process = _get(cookie, "/site/process/start-info", {"app_id": APP_ID})
+def _read_config(cookie: str, sess_id, process=None, *, deadline=None) -> dict:
+    def read(path, params):
+        timeout = min(5, deadline - time.perf_counter()) if deadline is not None else 5
+        if timeout <= 0:
+            raise RuntimeError("支付配置预读已过期")
+        return _get(cookie, path, params, timeout=timeout)
+    if process is None:
+        process = read("/site/process/start-info", {"app_id": APP_ID})
     forms = process.get("form") or []
     if len(forms) != 1:
         raise RuntimeError("支付流程不再是单表单，停止使用当前实现")
     form_id, bpmn_id = forms[0]["form_id"], process["bpmn_id"]
-    form = _get(cookie, "/site/form/get-formv", {"id": form_id, "bpmn_id": bpmn_id,
-                "sess_id": reservation.get("sess_id", 0), "report_id": 0})
+    form = read("/site/form/get-formv", {"id": form_id, "bpmn_id": bpmn_id,
+                "sess_id": sess_id, "report_id": 0})
     if str(form.get("app_id")) != str(APP_ID) or str(form.get("id")) != str(form_id):
         raise RuntimeError("表单归属不匹配")
     config = _payment_config(form.get("plugins"))
+    return {"form": form, "form_id": form_id, "bpmn_id": bpmn_id, "config": config}
+
+
+class PaymentConfigPrefetch:
+    """两次只读配置请求；绑定登录、sess 0，60 秒内仅使用一次，不等待后台。"""
+    def __init__(self, cookie: str, *, clock=None):
+        self._clock = clock or time.perf_counter
+        self._cookie = cookie
+        self._taken = False
+        self._completed = Future()
+
+        def run():
+            try:
+                config = _read_config(cookie, 0, deadline=time.perf_counter() + 8)
+                self._completed.set_result((config, self._clock()))
+            except Exception as exc:
+                self._completed.set_exception(exc)
+        Thread(target=run, daemon=True, name="payment-config").start()
+
+    def take(self, cookie: str, sess_id):
+        if self._taken:
+            return None
+        self._taken = True
+        original_cookie, self._cookie = self._cookie, None
+        if cookie != original_cookie or str(sess_id) != "0" or not self._completed.done():
+            return None
+        try:
+            config, ready_at = self._completed.result()
+        except Exception as exc:
+            record("timing", stage="payment_config_prefetch", error_type=type(exc).__name__)
+            return None
+        if not 0 <= self._clock() - ready_at <= 60:
+            return None
+        record("timing", stage="payment_config_prefetch", code="READY")
+        return config
+
+
+def prepare_payment(cookie: str, rid: int, *, now: datetime | None = None,
+                    reservation: dict | None = None, preparation=None, preparation_deadline=None) -> dict:
+    """只读核对有效预约与现行表单，不创建订单。"""
+    now = now or datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    process = None
+    if reservation is None:
+        if preparation is None:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="payment-read") as reads:
+                detail_read = reads.submit(_detail, cookie, rid)
+                process_read = reads.submit(_get, cookie, "/site/process/start-info", {"app_id": APP_ID})
+                reservation, process = detail_read.result(), process_read.result()
+        else:
+            reservation = _detail(cookie, rid)
+    if str(reservation.get("id")) != str(rid):
+        raise RuntimeError("预约回执 ID 不匹配，不创建订单")
+    day, court, slot, periods = _period(reservation, now)
+    amount = _amount(reservation.get("pay_money"))
+    sess_id = reservation.get("sess_id", 0)
+    prepared = preparation.take(cookie, sess_id) if preparation is not None else None
+    prepared = prepared or _read_config(cookie, sess_id, process)
+    form, form_id = prepared["form"], prepared["form_id"]
+    bpmn_id, config = prepared["bpmn_id"], prepared["config"]
     label, name = (f"{court}, {day} {slot}", f"{day} {slot}")
     if "; " in slot or any((datetime.fromisoformat(day + "T" + text.strip().split("-")[1]) -
             datetime.fromisoformat(day + "T" + text.strip().split("-")[0])).total_seconds() != 3600
             for period in reservation["period_text"].values() for text in period["text"]):
-        label, name = _canonical_labels(cookie, reservation, form)
+        label, name = _canonical_labels(cookie, reservation, form, deadline=preparation_deadline)
     return {"rid": rid, "venue": reservation["resource_id"], "day": day,
-            "court": court, "slot": slot, "amount": f"{amount:.2f}",
+            "court": court, "slot": slot, "periods": periods, "amount": f"{amount:.2f}",
             "form_id": form_id, "bpmn_id": bpmn_id, "config": config,
             "payload": {"app_id": str(APP_ID), "node_id": "", "form_data": {str(form_id): {
                 "Input_7": label, "Input_14": name}}}}
 
 
-def create_payment(cookie: str, rid: int, *, now: datetime | None = None) -> dict:
+def create_payment(cookie: str, rid: int, *, now: datetime | None = None,
+                   reservation: dict | None = None, preparation=None, preparation_deadline=None) -> dict:
     """仅创建一次未付款订单；所有校验通过才返回支付链接。"""
     started = time.perf_counter()
-    plan = prepare_payment(cookie, rid, now=now)
+    try:
+        plan = prepare_payment(cookie, rid, now=now, reservation=reservation, preparation=preparation,
+                               preparation_deadline=preparation_deadline)
+        if preparation_deadline is not None and time.monotonic() >= preparation_deadline:
+            raise RuntimeError("本次支付准备期限已过")
+    except RuntimeError as exc:
+        raise PaymentPreparationError(f"{exc}；本次尚未发送创建订单请求") from exc
     orders = _rows(cookie, "/site/payment-order/my-list")
     if any(str(row.get("appointment_id")) == str(rid) for row in orders):
         raise RuntimeError("该预约已有支付订单，不重复创建；请先在网页核对")
@@ -193,7 +298,7 @@ def create_payment(cookie: str, rid: int, *, now: datetime | None = None) -> dic
         raise RuntimeError(f"支付前校验未进入支付分支：e={check.get('e')} {check.get('m')}")
     latest = _detail(cookie, rid)
     latest_now = now or datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
-    if (_period(latest, latest_now) != (plan["day"], plan["court"], plan["slot"])
+    if (_period(latest, latest_now) != (plan["day"], plan["court"], plan["slot"], plan["periods"])
             or str(latest.get("resource_id")) != str(plan["venue"])
             or _amount(latest.get("pay_money")) != Decimal(plan["amount"])):
         raise RuntimeError("支付前预约身份或金额发生变化")
@@ -209,6 +314,8 @@ def create_payment(cookie: str, rid: int, *, now: datetime | None = None) -> dic
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("缺少可核对的支付剩余时间，不创建订单") from exc
         estimated = True
+    if preparation_deadline is not None:
+        remaining = min(remaining, preparation_deadline - time.monotonic())
     if remaining <= 0:
         raise RuntimeError("预计支付窗口已过，请在网页核对预约状态")
     deadline = time.monotonic() + remaining
@@ -281,7 +388,7 @@ def main() -> int:
         from qr_popup import show_qr
         from auto import reservation_paid
         paid = show_qr(result["content"], title=f"{result['day']} {result['court']} {result['slot']} ¥{result['amount']}",
-                       on_poll=lambda: reservation_paid(c, args.reserve_id),
+                       on_poll=lambda: reservation_paid(c, args.reserve_id, order_id=result["order_id"]),
                        deadline=result["deadline"], estimated=result["estimated"])
         print("服务端确认预约生效" if paid else "未确认预约生效，请在网页核对")
         return 0 if paid else 1

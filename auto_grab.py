@@ -3,7 +3,7 @@
 """
 【最终方案】22:00 卡点抢次日场地 —— 全自动，验证码也自动。
 
-流程（全部自动，约 3-5 秒完成）：
+流程（耗时由网络、服务端和识别结果决定）：
     1. 21:59:30 开始，用 HTTP 高频轮询 resource-info-margin
        发现目标时段 status 变成可约、margin>0 就立刻动手
     2. 抓验证码（/site/captcha/click-get），模板匹配出 4 个字的坐标
@@ -38,6 +38,8 @@ sys.path.insert(0, str(HERE / "tools"))
 from captcha_solver import aes_ecb_encrypt_b64  # noqa: E402
 from captcha_v4 import solve as solve_captcha  # noqa: E402
 from shape_adapter import parse_margin  # noqa: E402
+from http_transport import get_transport  # noqa: E402
+from run_diagnostics import record  # noqa: E402
 
 BASE = "https://eportal.hnu.edu.cn"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,15 +49,22 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # --------------------------------------------------------------------------- #
 def _req(path: str, params: dict | None = None, form: dict | None = None,
          cookie: str = "", timeout: float = 12.0) -> dict:
-    from urllib import error as urlerror
-    from urllib import parse, request
+    from urllib import parse
 
     url = f"{BASE}{path}"
+    referer = f"{BASE}/v2/reserve/reserveHall"
+    if path in ("/site/reservation/resource-info", "/site/reservation/resource-info-margin",
+                "/site/reservation/launch"):
+        payload = form if form is not None else (params or {})
+        resource_id = str(payload.get("resource_id", ""))
+        if resource_id.isascii() and resource_id.isdecimal() and int(resource_id) > 0:
+            referer = f"{BASE}/v2/reserve/reserveDetail?id={int(resource_id)}"
     headers = {
         "User-Agent": UA,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Referer": f"{BASE}/v2/reserve/reserveDetail?id=57",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": referer,
         "Cookie": cookie,
     }
     data = None
@@ -64,18 +73,7 @@ def _req(path: str, params: dict | None = None, form: dict | None = None,
         headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
     elif params:
         url += "?" + parse.urlencode(params)
-    req = request.Request(url, data=data, headers=headers,
-                          method="POST" if data else "GET")
-    try:
-        with request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except urlerror.HTTPError as exc:
-        try:
-            return json.loads(exc.read().decode("utf-8", "replace"))
-        except Exception:
-            return {"e": exc.code, "m": "HTTPError"}
-    except Exception as exc:
-        return {"e": "EXC", "m": str(exc)}
+    return get_transport().request_json(url, headers=headers, data=data, timeout=timeout)
 
 
 def load_cookie() -> str:
@@ -86,15 +84,16 @@ def load_cookie() -> str:
 # --------------------------------------------------------------------------- #
 class RequestError(RuntimeError):
     def __init__(self, response: dict):
-        self.code = str(response.get("e", "SHAPE"))
+        value = response.get("e")
+        self.code = str(value) if type(value) in (int, str) else "SHAPE"
         self.retryable = self.code in ("EXC", "408", "429", "500", "502", "503", "504")
         message = ("登录已失效，请运行 python cdp_cookie.py --wait"
-                   if self.code == "10042" else str(response.get("m") or "接口响应结构异常"))
+                   if self.code in ("10042", "10043") else str(response.get("m") or "接口响应结构异常"))
         super().__init__(f"e={self.code}: {message}")
 
 
 def require_success(response: dict) -> None:
-    if response.get("e") not in (0, "0"):
+    if type(response.get("e")) not in (int, str) or response.get("e") not in (0, "0"):
         raise RequestError(response)
 
 
@@ -102,11 +101,22 @@ def fetch_slots(cookie: str, venue: int, date: str) -> list[dict]:
     js = _req("/site/reservation/resource-info-margin",
               {"resource_id": venue, "start_time": date, "end_time": date},
               cookie=cookie)
+    return [slot for slot in parse_slots_response(js) if slot.get("date") == date]
+
+
+def parse_slots_response(js: dict) -> list[dict]:
+    """Share identical availability checks between warmup and ordinary queries."""
     require_success(js)
-    slots = parse_margin(js)
+    slots = parse_margin(js, include_unavailable=True)
     if slots is None:
         raise RuntimeError("预约接口结构不认识，停止查询；请检查接口适配")
-    return slots
+    record("availability", total_cells=len(slots),
+           available_cells=sum(slot["available"] for slot in slots))
+    available = []
+    for slot in slots:
+        if slot.pop("available"):
+            available.append(slot)
+    return available
 
 
 def get_captcha(cookie: str) -> dict | None:

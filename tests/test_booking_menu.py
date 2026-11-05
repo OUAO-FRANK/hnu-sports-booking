@@ -37,6 +37,7 @@ class MenuTests(unittest.TestCase):
         self.assertIn("22:00:00", args)
         self.assertIn("免费", output)
         self.assertNotIn("--court", args)
+        self.assertNotIn('--allow-court-change', args)
         self.assertNotIn("一站式", output)
         self.assertNotIn("非体育空间", output)
         self.assertNotIn("选择项目 / 大厅", output)
@@ -56,7 +57,7 @@ class MenuTests(unittest.TestCase):
     def test_court_enter_defaults_to_any_and_time_examples_are_shown(self):
         cells = [cell(t, c, 20) for t in ["20:10-21:10", "21:10-22:10"]
                  for c in ["1号场", "2号场"]]
-        args, output = self.choose(["1", "", "1,2", "", "1", "yes"],
+        args, output = self.choose(["1", "", "1,2", "", "", "1", "yes"],
                                   resource=info(57, 2, 1), cells=cells)
         self.assertIsNotNone(args)
         self.assertNotIn("--court", args)
@@ -64,6 +65,34 @@ class MenuTests(unittest.TestCase):
         self.assertIn("多段示例", output)
         self.assertIn("1,2", output)
         self.assertIn("回车直接选择", output)
+        self.assertIn('--allow-court-change', args)
+        self.assertIn('优先同场', output)
+
+    def test_can_keep_strict_same_court_policy(self):
+        cells = [cell(t, c, 20) for t in ['20:10-21:10', '21:10-22:10'] for c in ['1号场', '2号场']]
+        args, output = self.choose(['1', '', '1,2', '', '2', '1', 'yes'],
+                                  resource=info(57, 2, 1), cells=cells)
+        self.assertIsNotNone(args)
+        self.assertNotIn('--allow-court-change', args)
+        self.assertIn('必须同一块', output)
+
+    def test_no_common_court_can_choose_cross_court_policy(self):
+        cells = [cell('20:10-21:10', '1号场', 20), cell('21:10-22:10', '2号场', 20)]
+        try:
+            args, output = self.choose(['1', '', '1,2', '', '', '1', 'yes'],
+                                      resource=info(57, 2, 1), cells=cells)
+        except RuntimeError as exc:
+            self.fail(f'Cross-court selection should be offered: {exc}')
+        self.assertIn('--allow-court-change', args)
+        self.assertIn('20:10-21:10;21:10-22:10', args)
+        self.assertIn('允许换场', output)
+
+    def test_strict_policy_without_common_court_reprompts(self):
+        cells = [cell('20:10-21:10', '1号场', 20), cell('21:10-22:10', '2号场', 20)]
+        args, output = self.choose(['1', '', '1,2', '', '2', '1', '1', 'yes'],
+                                  resource=info(57, 2, 1), cells=cells)
+        self.assertIn('--allow-court-change', args)
+        self.assertIn('请允许换场或输入 q 退出', output)
 
     def test_two_periods_and_specific_court(self):
         cells = [cell(t, c, 20) for t in ["20:10-21:10", "21:10-22:10"]
@@ -73,6 +102,12 @@ class MenuTests(unittest.TestCase):
         self.assertIn("20:10-21:10;21:10-22:10", args)
         self.assertEqual(args[args.index("--court") + 1], "2号场")
         self.assertIn("--now", args)
+        self.assertNotIn('--allow-court-change', args)
+
+    def test_cross_court_policy_can_be_cancelled_before_confirmation(self):
+        cells = [cell('20:10-21:10', '1号场', 20), cell('21:10-22:10', '2号场', 20)]
+        args, _ = self.choose(['1', '', '1,2', '', 'q'], resource=info(57, 2, 1), cells=cells)
+        self.assertIsNone(args)
 
     def test_gym_rejects_two_periods_and_reprompts(self):
         args, output = self.choose(["1", "", "1,2", "2", "1", "yes"])

@@ -105,6 +105,12 @@ class WS:
     def _recv_exact(self, n: int) -> bytes:
         buf = b""
         while len(buf) < n:
+            deadline = getattr(self, "_deadline", None)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("WebSocket call deadline expired")
+                self.sock.settimeout(remaining)
             chunk = self.sock.recv(n - len(buf))
             if not chunk:
                 raise RuntimeError("连接断开")
@@ -112,15 +118,27 @@ class WS:
         return buf
 
     def call(self, method: str, params: dict | None = None, timeout: float = 12.0) -> dict:
-        want = self.send({"method": method, "params": params or {}})
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = json.loads(self._recv_frame())
-            if msg.get("id") == want:
-                if "error" in msg:
-                    raise RuntimeError(msg["error"])
-                return msg.get("result", {})
-        raise RuntimeError(f"{method} 超时")
+        previous_timeout = self.sock.gettimeout()
+        self._deadline = time.monotonic() + timeout
+        try:
+            if timeout <= 0:
+                raise TimeoutError("WebSocket call deadline expired")
+            self.sock.settimeout(timeout)
+            want = self.send({"method": method, "params": params or {}})
+            while time.monotonic() < self._deadline:
+                msg = json.loads(self._recv_frame())
+                if time.monotonic() >= self._deadline:
+                    break
+                if msg.get("id") == want:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"])
+                    return msg.get("result", {})
+            raise TimeoutError("WebSocket call deadline expired")
+        except TimeoutError:
+            raise RuntimeError(f"{method} 超时") from None
+        finally:
+            self._deadline = None
+            self.sock.settimeout(previous_timeout)
 
     def close(self):
         try:
@@ -133,13 +151,17 @@ class WS:
 # CDP 操作
 # --------------------------------------------------------------------------- #
 def list_targets(port: int) -> list[dict]:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3) as r:
+    # CDP is strictly local; never forward its requests through a system proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=3) as r:
         return json.loads(r.read().decode())
 
 
-def wait_cdp(port: int, timeout: float = 30.0) -> bool:
+def wait_cdp(port: int, timeout: float = 30.0, process=None) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if process is not None and process.poll() not in (None, 0):
+            return False
         try:
             list_targets(port)
             return True
@@ -177,7 +199,7 @@ def cookie_header(cookies: list[dict]) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
 
-def launch(port: int) -> None:
+def launch(port: int):
     exe = find_browser()
     if not exe:
         print("[!] 没找到 Chrome 或 Edge")
@@ -186,7 +208,7 @@ def launch(port: int) -> None:
     print(f"[*] 浏览器: {exe}")
     print(f"[*] 专用配置目录: {PROFILE}")
     print(f"[*] 调试端口: {port}")
-    subprocess.Popen(
+    return subprocess.Popen(
         [exe, f"--remote-debugging-port={port}",
          f"--user-data-dir={PROFILE}",
          "--no-first-run", "--no-default-browser-check",
@@ -227,10 +249,16 @@ def main() -> int:
         if wait_cdp(a.port, timeout=1.5):
             print(f"[*] 端口 {a.port} 已经有调试实例，直接复用")
         else:
-            launch(a.port)
+            process = launch(a.port)
             started = True
-            if not wait_cdp(a.port, timeout=30):
-                print("[!] Chrome 起来了但调试端口连不上，换个端口试：--port 9223")
+            if not wait_cdp(a.port, timeout=30, process=process):
+                code = process.poll()
+                if code not in (None, 0):
+                    print(f"[!] 浏览器启动后已退出，退出码 {code}（0x{code & 0xffffffff:08X}）；不是单纯的端口等待问题")
+                    print("    请检查浏览器能否正常打开、配置目录是否可写，以及终端中的启动错误。")
+                else:
+                    print("[!] 浏览器调试接口未就绪；可能复用了未启用调试的旧进程，或端口受限。")
+                    print("    请保留原窗口，在新的专用浏览器配置中重试；不要直接清理个人浏览器数据。")
                 return 1
             print("[*] Chrome 已启动")
 

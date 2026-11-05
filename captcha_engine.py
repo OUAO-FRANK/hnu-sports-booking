@@ -19,10 +19,12 @@ from __future__ import annotations
 import json
 import re
 import sys
+from os import cpu_count
 from pathlib import Path
+from time import monotonic
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 MODELS = Path(__file__).resolve().parent / "models"
 
@@ -48,6 +50,7 @@ class _Yolo:
         import onnxruntime as ort
         _o = ort.SessionOptions()
         _o.log_severity_level = 4
+        _o.intra_op_num_threads = min(4, cpu_count() or 1)
         self.sess = ort.InferenceSession(
             str(onnx_path), sess_options=_o,
             providers=["CPUExecutionProvider"])
@@ -61,16 +64,16 @@ class _Yolo:
         import cv2
         rgb = np.asarray(pil.convert("RGB"))
         h0, w0 = rgb.shape[:2]
-        bgr = rgb[:, :, ::-1]
 
         scale = min(self.in_w / w0, self.in_h / h0)
         nw, nh = int(w0 * scale), int(h0 * scale)
         canvas = np.full((self.in_h, self.in_w, 3), 114, np.uint8)
         dx, dy = (self.in_w - nw) // 2, (self.in_h - nh) // 2
         canvas[dy:dy + nh, dx:dx + nw] = cv2.resize(
-            bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-        blob = canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        blob = np.ascontiguousarray(canvas.transpose(2, 0, 1)[None], dtype=np.float32)
+        blob /= 255.0
         out = self.sess.run(None, {self.in_name: blob})[0]   # [1, 300, 6]
 
         boxes = []
@@ -98,6 +101,7 @@ class _Ocr:
         import onnxruntime as ort
         _o = ort.SessionOptions()
         _o.log_severity_level = 4
+        _o.intra_op_num_threads = min(4, cpu_count() or 1)
         self.sess = ort.InferenceSession(
             str(onnx_path), sess_options=_o,
             providers=["CPUExecutionProvider"])
@@ -152,7 +156,16 @@ class CaptchaEngine:
         self.yolo = _Yolo(models_dir / "yolo_detect.onnx")
         self.ocr = _Ocr(models_dir / "ppocr.onnx", models_dir / "charsets.txt")
 
+    def warmup(self):
+        """Initialize both inference paths locally, without requesting a captcha."""
+        self.yolo.infer(Image.new("RGB", (310, 155), "white"))
+        self.ocr.read(Image.new("L", (32, 32), 255))
+
     def detect(self, pil: Image.Image) -> list[list[int]]:
+        """保持常规检测条件；低置信度补救另需 solve 的精确 OCR 校验。"""
+        return self._detect(pil)[0]
+
+    def _detect(self, pil: Image.Image, *, rescue=False, strict_four=False) -> tuple[list[list[int]], bool]:
         """检测字框，返回按 x 排序的框（通常 4 个）。
 
         坑：模型输出 [1,300,6] 里除了 4 个真框，还有 165+ 个 conf≈0 的
@@ -178,18 +191,35 @@ class CaptchaEngine:
                 cand.append(d)
             uniq = _dedupe(cand)
             if len(uniq) >= 4:
+                if strict_four and len(uniq) != 4:
+                    return [], False
                 uniq = sorted(uniq, key=lambda b: b[0])[:4]
-                return [[int(b[0]), int(b[1]), int(b[2]), int(b[3])] for b in uniq]
+                return [[int(b[0]), int(b[1]), int(b[2]), int(b[3])] for b in uniq], False
 
-        # 兜底：用最宽松的条件
-        cand = [d for d in solid if d[4] >= 0.20]
-        uniq = _dedupe(cand)
+        if strict_four:
+            return [], False
+        uniq = _dedupe(solid)
+        needs_exact_ocr = False
+        # Only a previously incomplete result may use lower-confidence geometry.
+        if rescue and len(uniq) < 4:
+            _, lo, hi, ar_max = SIZE_TIERS[-1]
+            candidates = []
+            for d in raw:
+                w, h = d[2] - d[0], d[3] - d[1]
+                if (d[4] >= 0.20 and lo <= w <= hi and lo <= h <= hi
+                        and max(w, h) / min(w, h) <= ar_max):
+                    candidates.append(d)
+            recovered = _dedupe(candidates)
+            if len(recovered) == 4:
+                uniq, needs_exact_ocr = recovered, True
         uniq = sorted(uniq, key=lambda b: b[0])
-        return [[int(b[0]), int(b[1]), int(b[2]), int(b[3])] for b in uniq]
+        return [[int(b[0]), int(b[1]), int(b[2]), int(b[3])] for b in uniq], needs_exact_ocr
 
-    def solve(self, pil: Image.Image, words: list[str]
+    def solve(self, pil: Image.Image, words: list[str], *, contrast_deadline=None
               ) -> tuple[list[list[int]], list[str]]:
         """返回 (按词表顺序的坐标, 每个框的 OCR 结果)。
+
+        contrast_deadline 是显式传入的单调时钟截止时间；默认不额外增强检测。
 
         配对策略（实测重要）：
             词表 4 个字互不相同，而且服务端校验时要求「4 个点全对」。
@@ -200,13 +230,22 @@ class CaptchaEngine:
             但 0/4 精确匹配时也有通过的情况 —— 说明 OCR 错但位置对
             （因为字库相近字被混淆，位置本身没错）。
         """
-        boxes = self.detect(pil)
+        four_distinct = len(words) == 4 and len(set(words)) == 4
+        boxes, needs_exact_ocr = self._detect(pil, rescue=four_distinct)
+        if (len(boxes) < 4 and four_distinct
+                and all(isinstance(word, str) and len(word) == 1 for word in words)
+                and contrast_deadline is not None and monotonic() < contrast_deadline):
+            enhanced = ImageEnhance.Contrast(pil).enhance(1.5)
+            boxes, _ = self._detect(enhanced, strict_four=True)
+            needs_exact_ocr = True
         if len(boxes) != len(words):
             return [], []
         heard = []
         for b in boxes:
             crop = pil.crop((b[0], b[1], b[2], b[3]))
             heard.append(self.ocr.read(crop) if crop.width and crop.height else "")
+        if needs_exact_ocr and set(heard) != set(words):
+            return [], heard
 
         # 打分矩阵：字 × 框
         n = len(words)

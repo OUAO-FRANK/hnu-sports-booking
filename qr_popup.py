@@ -33,15 +33,55 @@
 """
 from __future__ import annotations
 
+import atexit
 import threading
 import time
 from math import ceil
 from queue import Empty, SimpleQueue
 from pathlib import Path
+from run_diagnostics import record
 
 
 class PaymentStopped(RuntimeError):
     """服务端已确认预约结束，不能继续提示用户付款。"""
+
+
+_prepared_root = None
+
+
+def _discard_prepared_root():
+    global _prepared_root
+    if _prepared_root is None or _prepared_root[0] != threading.get_ident():
+        return
+    _, root = _prepared_root
+    _prepared_root = None
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+
+atexit.register(_discard_prepared_root)
+
+
+def warmup():
+    """预先初始化隐藏窗口；不显示二维码、不发请求、不生成支付内容。"""
+    global _prepared_root
+    import tkinter as tk
+    import tkinter.font
+    import segno
+    from PIL import Image, ImageTk
+    if threading.current_thread() is not threading.main_thread():
+        return
+    _discard_prepared_root()
+    try:
+        root = tk.Tk()
+        _prepared_root = threading.get_ident(), root
+        root.withdraw()
+        root.update_idletasks()
+    except tk.TclError as exc:
+        _discard_prepared_root()
+        raise RuntimeError("无法预初始化二维码窗口") from exc
 
 
 class _PaymentCheck:
@@ -112,6 +152,7 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
 
     返回 True 表示支付成功（由 on_poll 判定），False 表示超时/手动关闭。
     """
+    started = time.perf_counter()
     import tkinter as tk
     from tkinter import font as tkfont
     if deadline is None:
@@ -128,12 +169,18 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
 
     from PIL import Image, ImageTk
 
-    state = {"done": False, "paid": False, "finished": False}
+    state = {"done": False, "paid": False, "finished": False, "exit_reason": "UNEXPECTED_EXIT"}
     check = _PaymentCheck(on_poll)
     stop_beep = threading.Event()
 
     # ---- 主窗口 ----
-    root = tk.Tk()
+    global _prepared_root
+    prepared = _prepared_root is not None and _prepared_root[0] == threading.get_ident()
+    if prepared:
+        _, root = _prepared_root
+        _prepared_root = None
+    else:
+        root = tk.Tk()
     root.title("扫码支付")
     root.attributes("-topmost", True)
     root.configure(bg="#1a1a1a")
@@ -145,16 +192,16 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
     root.geometry(f"620x{window_height}+{(sw-620)//2}+{max(0,(sh-window_height)//2-20)}")
 
     # 标题
-    f_title = tkfont.Font(family="Microsoft YaHei", size=16, weight="bold")
-    f_mono = tkfont.Font(family="Consolas", size=10)
-    f_big = tkfont.Font(family="Microsoft YaHei", size=28, weight="bold")
+    f_title = tkfont.Font(root=root, family="Microsoft YaHei", size=16, weight="bold")
+    f_mono = tkfont.Font(root=root, family="Consolas", size=10)
+    f_big = tkfont.Font(root=root, family="Microsoft YaHei", size=28, weight="bold")
 
     if title:
         tk.Label(root, text=title, font=f_title,
                  fg="#00ff88", bg="#1a1a1a",
                  wraplength=580).pack(pady=(14, 6))
 
-    tk.Label(root, text="请立即扫码支付", font=f_title,
+    tk.Label(root, text="请用微信扫一扫支付", font=f_title,
              fg="#ffffff", bg="#1a1a1a").pack(pady=2)
 
     # 二维码图
@@ -165,7 +212,7 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
     canvas_img.paste(img.convert("RGB"),
                      ((side - img.size[0]) // 2, (side - img.size[1]) // 2))
     canvas_img = canvas_img.resize((qr_side, qr_side), Image.NEAREST)
-    photo = ImageTk.PhotoImage(canvas_img)
+    photo = ImageTk.PhotoImage(canvas_img, master=root)
 
     lbl_img = tk.Label(root, image=photo, bg="#1a1a1a", bd=0)
     lbl_img.image = photo
@@ -190,18 +237,39 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
         status_lbl.config(text="✓ 链接已复制到剪贴板", fg="#00ff88")
 
     lbl_url.bind("<Button-1>", copy_url)
-    btn_copy = tk.Button(root, text="复制链接", command=copy_url,
+    actions = tk.Frame(root, bg="#1a1a1a")
+    actions.pack(pady=4)
+    btn_copy = tk.Button(actions, text="复制链接", command=copy_url,
                          bg="#333", fg="white", bd=0,
                          font=("Microsoft YaHei", 11), padx=16, pady=5)
-    btn_copy.pack(pady=4)
+    btn_copy.pack(side="left", padx=5)
+
+    def open_records():
+        import webbrowser
+        try:
+            opened = webbrowser.open("https://eportal.hnu.edu.cn/v2/site/ucenter?showroute=myAppointment")
+        except OSError:
+            opened = False
+        status_lbl.config(text=("请在学校预约记录中核对本次预约和待付款订单" if opened
+                               else "无法打开浏览器，请手动进入学校一网通办的预约记录"), fg="#ffcc00")
+
+    tk.Button(actions, text="打开学校预约记录", command=open_records,
+              bg="#333", fg="white", bd=0, font=("Microsoft YaHei", 11),
+              padx=12, pady=5).pack(side="left", padx=5)
 
     status_lbl = tk.Label(root, text="", font=("Microsoft YaHei", 11),
                           fg="#ffcc00", bg="#1a1a1a", wraplength=580)
     status_lbl.pack(pady=(6, 4))
 
-    def close_all(paid: bool = False):
+    def close_all(paid: bool = False, *, reason="USER_CLOSED"):
+        if state["done"]:
+            return
         state["done"] = True
         state["paid"] = paid or state["paid"]
+        if state["paid"]:
+            state["exit_reason"] = "CONFIRMED"
+        elif state["exit_reason"] != "RESERVATION_ENDED":
+            state["exit_reason"] = reason
         stop_beep.set()
         try:
             root.destroy()
@@ -214,6 +282,12 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
         status_lbl.config(text="正在核对服务端预约状态…", fg="#ffcc00")
         check.start()
 
+    def callback_error(error_type, error, traceback):
+        record("timing", stage="qr_popup_error", error_type=error_type.__name__)
+        close_all(reason="UI_ERROR")
+
+    root.report_callback_exception = callback_error
+
     tk.Button(root, text="我已付款，重新检查", command=request_check,
               bg="#00aa55", fg="white", bd=0,
               font=("Microsoft YaHei", 12, "bold"),
@@ -221,6 +295,9 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
     tk.Button(root, text="关闭", command=lambda: close_all(False),
               bg="#444", fg="white", bd=0,
               font=("Microsoft YaHei", 11), padx=20, pady=5).pack(pady=(0, 12))
+
+    root.after_idle(lambda: record("timing", stage="qr_popup_visible",
+                                  duration_ms=round((time.perf_counter() - started) * 1000, 1)))
 
     # ---- 响铃线程 ----
     threading.Thread(target=_beep_loop, args=(stop_beep,),
@@ -235,7 +312,7 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
             lbl_time.config(text="00:00")
             status_lbl.config(text="未确认预约生效，请在网页核对",
                               fg="#ff4444")
-            close_all(False)
+            close_all(False, reason="DEADLINE")
             return
         m, s = divmod(left, 60)
         label = "预计剩余" if estimated else "剩余"
@@ -259,6 +336,7 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
             if paid:
                 state["paid"] = True
                 state["finished"] = True
+                state["exit_reason"] = "CONFIRMED"
                 stop_beep.set()
                 status_lbl.config(text="✓ 服务端确认预约生效！", fg="#00ff88")
                 lbl_time.config(text="", fg="#00ff88")
@@ -266,6 +344,7 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
                 return
             if isinstance(error, PaymentStopped):
                 state["finished"] = True
+                state["exit_reason"] = "RESERVATION_ENDED"
                 stop_beep.set()
                 status_lbl.config(text=str(error), fg="#ff4444")
                 root.after(2000, lambda: close_all(False))
@@ -276,13 +355,12 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
             pass
         root.after(100, receive_result)
 
+    # Register before tick(), which may immediately destroy an expired window.
+    root.protocol("WM_DELETE_WINDOW", lambda: close_all(False))
     if on_poll:
         poll()
         root.after(100, receive_result)
     tick()
-
-    # 窗口关闭按钮
-    root.protocol("WM_DELETE_WINDOW", lambda: close_all(False))
 
     # 强制置顶 + 抢焦点
     def force_top(remaining=3):
@@ -294,13 +372,27 @@ def show_qr(content: str, title: str = "", seconds: int = 120,
         if remaining > 1:
             root.after(250, lambda: force_top(remaining - 1))
 
+    if prepared and not state["done"]:
+        root.deiconify()
     force_top()
 
     try:
         root.mainloop()
-    except Exception:
-        pass
-    stop_beep.set()
+    except KeyboardInterrupt:
+        state["exit_reason"] = "INTERRUPTED"
+        raise
+    except Exception as exc:
+        state["exit_reason"] = "UI_ERROR"
+        record("timing", stage="qr_popup_error", error_type=type(exc).__name__)
+    finally:
+        stop_beep.set()
+        if not state["done"]:
+            close_all(reason=state["exit_reason"])
+        if state["paid"]:
+            state["exit_reason"] = "CONFIRMED"
+        record("payment_ui", reason=state["exit_reason"],
+               outcome="CONFIRMED" if state["paid"] else "UNCONFIRMED",
+               duration_ms=round((time.perf_counter() - started) * 1000, 1))
     return state["paid"]
 
 
