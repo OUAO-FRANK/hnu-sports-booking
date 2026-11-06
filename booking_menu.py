@@ -140,6 +140,11 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
         if release and datetime.fromisoformat(now.date().isoformat() + "T" + release) < datetime_start(day, selected[0]):
             modes.append(f"等待今天 {release} 放号（已过则立即开始）")
         mode = pick("选择启动方式", modes)
+        if mode == 1:
+            output("\n========== 定时预约 · 请先同步电脑时间 ==========")
+            output("  Windows「设置」→「时间和语言」→「日期和时间」→「立即同步」")
+            while ask("同步完成后输入 sync 继续（q 退出）：").lower() != "sync":
+                output("请先完成时间同步，再输入 sync。预约清单将在下一步显示。")
         args = ["--venue", str(venue["id"]), "--date", day, "--times", ";".join(selected)]
         args += ["--court", court] if court else []
         args += ["--allow-court-change"] if allow_court_change else []

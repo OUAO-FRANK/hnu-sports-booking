@@ -31,7 +31,7 @@ class MenuTests(unittest.TestCase):
         return args, "\n".join(output)
 
     def test_free_gym_uses_actual_single_period_and_release_time(self):
-        args, output = self.choose(["1", "", "3", "2", "yes"])
+        args, output = self.choose(["1", "", "3", "2", "sync", "yes"])
         self.assertIn("20:00-21:30", args)
         self.assertIn("--at", args)
         self.assertIn("22:00:00", args)
@@ -117,6 +117,20 @@ class MenuTests(unittest.TestCase):
     def test_no_confirmation_returns_no_booking(self):
         args, _ = self.choose(["1", "", "1", "1", "no"])
         self.assertIsNone(args)
+
+    def test_scheduled_yes_cannot_skip_time_sync(self):
+        for hour in (21, 22):
+            with self.subTest(hour=hour):
+                args, output = self.choose(["1", "", "3", "2", "yes", "q"],
+                                          now=datetime(2026, 10, 29, hour, 42))
+                self.assertIsNone(args)
+                self.assertIn("立即同步", output)
+                self.assertNotIn("请确认预约清单", output)
+
+    def test_immediate_mode_does_not_require_time_sync(self):
+        args, output = self.choose(["1", "", "3", "1", "yes"])
+        self.assertIn("--now", args)
+        self.assertNotIn("立即同步", output)
 
     def test_finished_today_is_hidden_at_2311(self):
         args, output = self.choose(["1", "", "3", "1", "no"],

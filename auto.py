@@ -862,7 +862,8 @@ def main(argv=None) -> int:
             print(f"  {method}：本机{'快' if offset < 0 else '慢'}约 {abs(offset):.3f} 秒，"
                   f"已修正程序等待，保留 {clock_result['clock_guard_ms']:.0f}ms 余量")
         else:
-            print("  [!] 校时未通过，本次仍按本机时间等待；请确认系统时间已同步")
+            print("  [!] 校时未通过，本次仍按本机时间等待。")
+            print("  下次定时预约前，请打开 Windows「设置」→「时间和语言」→「日期和时间」，点击「立即同步」。")
 
     payment_preparation = None
     advanced = resource.get("json_advanced_rule") or {}
