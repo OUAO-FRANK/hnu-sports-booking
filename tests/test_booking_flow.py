@@ -507,6 +507,27 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([call[2] for call in calls], ["Court 2", "Court 1"])
 
+    def test_court_last_orders_complete_candidates_within_court_policy(self):
+        periods = ("19:10-20:10", "20:10-21:10")
+        cases = (
+            ("same court", ((1, 2), (1, 2)), ["2号场", "1号场"]),
+            ("cross court", ((2,), (1, 3)), ["2号场 → 3号场", "2号场 → 1号场"]),
+            ("same court still first", ((1, 2), (1, 3)), ["1号场"]),
+        )
+        for name, courts_by_period, expected in cases:
+            with self.subTest(name=name), patch("random.SystemRandom.shuffle", return_value=None):
+                slots = [dict(SLOT, court=f"{number}号场", time=period, period=index, sub=number)
+                         for index, (period, courts) in enumerate(zip(periods, courts_by_period), 1)
+                         for number in courts]
+                responses = [{"e": 1, "m": "该场已满"}] * (len(expected) - 1)
+                responses.append({"e": 0, "d": {"id": 101}})
+                code, calls, _, _ = self.run_flow(datetime(2026, 10, 29, 22),
+                    fetch=lambda *a: slots, times=";".join(periods), responses=responses,
+                    allow_court_change=True, extra_flags=("--court-last", "1号场"))
+                self.assertEqual(code, 0)
+                self.assertEqual([call[2] for call in calls], expected)
+                self.assertTrue(all([slot["period"] for slot in call[3]["slots"]] == [1, 2] for call in calls))
+
     def test_specific_court_does_not_randomize_selection(self):
         slots = [dict(SLOT, court=court) for court in ("Court 1", "Court 2")]
         with patch("random.SystemRandom.shuffle") as shuffle:

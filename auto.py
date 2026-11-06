@@ -703,7 +703,9 @@ def main(argv=None) -> int:
     selection = ap.add_mutually_exclusive_group()
     selection.add_argument("--slots", help="开场小时范围，约到一场就停，如 20-22")
     selection.add_argument("--times", help="完整时段，多段连续且同场地，如 20:10-21:10;21:10-22:10")
-    ap.add_argument("--court", default="", help="限定场地名称；留空不限")
+    court_options = ap.add_mutually_exclusive_group()
+    court_options.add_argument("--court", default="", help="限定场地名称；留空不限")
+    court_options.add_argument("--court-last", default="", help="不限场地时，把含指定场地的组合放到最后尝试")
     ap.add_argument("--allow-court-change", action="store_true",
                     help="优先同场地；无同场组合时允许完整时段跨场地一次提交")
     ap.add_argument("--date", default="")
@@ -1059,6 +1061,9 @@ def main(argv=None) -> int:
                 SystemRandom().shuffle(hits)
         else:
             hits.sort(key=lambda s: s["time"])
+        if a.court_last and len(hits) > 1:
+            hits.sort(key=lambda candidate: any(slot["court"] == a.court_last
+                                                for slot in candidate.get("slots", (candidate,))))
         record("query", attempt=attempt, slots_count=len(slots), matching_count=matching_count,
                candidate_count=len(hits), time_counts=time_counts)
 

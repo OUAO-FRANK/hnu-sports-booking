@@ -107,12 +107,22 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
         court_sets = [{s["court"] for s in matching if s["time"] == time} for time in selected]
         courts = sorted(set.intersection(*court_sets))
         court = ""
+        court_last = ""
         allow_court_change = False
         if courts != [""]:
             if not courts:
                 output("所选时段没有共同场地，可选择不限场地并允许换场。")
-            chosen = pick("选择场地", courts, zero=True)
-            court = courts[chosen] if chosen >= 0 else ""
+            last_option = "1号场" if int(venue["id"]) == 57 and any(s["court"] == "1号场" for s in matching) else ""
+            title = "选择场地"
+            labels = courts
+            if last_option:
+                title += f"\n  据反馈，{last_option}净高偏低。"
+                labels = [*courts, f"不限场地（{last_option}最后尝试）"]
+            chosen = pick(title, labels, zero=True)
+            if chosen == len(courts):
+                court_last = last_option
+            elif chosen >= 0:
+                court = courts[chosen]
             if not court and len(selected) > 1:
                 output("\n连续时段的场地安排")
                 output("  1. 优先同场；没有同场组合时允许换场（默认）")
@@ -147,6 +157,7 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
                 output("请先完成时间同步，再输入 sync。预约清单将在下一步显示。")
         args = ["--venue", str(venue["id"]), "--date", day, "--times", ";".join(selected)]
         args += ["--court", court] if court else []
+        args += ["--court-last", court_last] if court_last else []
         args += ["--allow-court-change"] if allow_court_change else []
         args += ["--at", release] if mode == 1 else ["--now"]
         output("\n请确认预约清单：")
@@ -155,6 +166,8 @@ def choose_booking(cookie: str, *, input_fn=None, output=print, now=None) -> lis
                        else ("无须选择场地" if courts == [""] else
                              ("不限场号，必须同一块场地" if len(selected) > 1 else "不限场号")))
         output(f"场地：{court or arrangement}")
+        if court_last:
+            output(f"场地优先级：先按所选的场地安排找组合，最后尝试含{court_last}的组合。")
         if allow_court_change:
             output("跨场组合会一次提交，以学校实际受理为准；不自动拆单，回执不完整时停止。")
         output(f"费用：{fee}；最终以预约回执为准，免费不创建支付订单")

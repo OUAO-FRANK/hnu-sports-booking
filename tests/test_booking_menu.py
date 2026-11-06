@@ -76,6 +76,26 @@ class MenuTests(unittest.TestCase):
         self.assertNotIn('--allow-court-change', args)
         self.assertIn('必须同一块', output)
 
+    def test_south_campus_court_last_is_optional(self):
+        cells = [cell("20:10-21:10", court, 20) for court in ("1号场", "2号场")]
+        south = info(57, 2, 1)
+        args, output = self.choose(["1", "", "1", "", "1", "yes"], resource=south, cells=cells)
+        self.assertIn("据反馈，1号场净高偏低", output)
+        self.assertIn("3. 不限场地（1号场最后尝试）", output)
+        self.assertNotIn("--court-last", args)
+
+        args, _ = self.choose(["1", "", "1", "1", "1", "yes"], resource=south, cells=cells)
+        self.assertEqual(args[args.index("--court") + 1], "1号场")
+        self.assertNotIn("--court-last", args)
+
+        args, output = self.choose(["1", "", "1", "3", "1", "yes"], resource=south, cells=cells)
+        self.assertEqual(args[args.index("--court-last") + 1], "1号场")
+        self.assertNotIn("--court", args)
+        self.assertIn("最后尝试含1号场的组合", output)
+
+        _, output = self.choose(["1", "", "1", "", "1", "yes"], resource=info(85, 2, 1), cells=cells)
+        self.assertNotIn("净高偏低", output)
+
     def test_no_common_court_can_choose_cross_court_policy(self):
         cells = [cell('20:10-21:10', '1号场', 20), cell('21:10-22:10', '2号场', 20)]
         try:
