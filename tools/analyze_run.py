@@ -1,5 +1,6 @@
 """Read one explicit JSONL log and report only allowlisted metrics; never write files."""
 import argparse
+from datetime import datetime
 import json
 import math
 from pathlib import Path
@@ -33,9 +34,25 @@ def _summary(values):
     return {"count": count, "median_ms": round(middle, 3), "max_ms": round(ordered[-1], 3)}
 
 
+def _plan_lead_ms(row):
+    recorded_at, release_at = row.get("time"), row.get("release_time")
+    if not all(isinstance(value, str) and "T" in value for value in (recorded_at, release_at)):
+        return None
+    try:
+        recorded_at = datetime.fromisoformat(recorded_at)
+        release_at = datetime.fromisoformat(release_at)
+        # A nominal release without an offset uses the same local wall clock as the plan.
+        if release_at.tzinfo is None:
+            recorded_at = recorded_at.replace(tzinfo=None)
+        return round((release_at - recorded_at).total_seconds() * 1000, 3)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def analyze_lines(lines):
     report = {"evidence": {"kind": "UNVERIFIED", "real_booking": "UNKNOWN", "peak_load": "UNKNOWN"},
-              "run_mode": "UNKNOWN", "first_dispatch_ms": None, "first_accepted_ms": None,
+              "run_mode": "UNKNOWN", "plan_lead_ms": None,
+              "first_dispatch_ms": None, "first_accepted_ms": None,
               "first_accepted_request_ms": None,
               "phases": {}, "launch_results": {}, "connections": {},
               "first_submission_connection": dict.fromkeys(("connection_reused", *CONNECTION_METRICS)),
@@ -59,6 +76,7 @@ def analyze_lines(lines):
         event, stage = row.get("event"), row.get("stage")
         if event == "plan" and row.get("run_mode") in ("scheduled", "immediate", "dry_run"):
             report["run_mode"] = row["run_mode"]
+            report["plan_lead_ms"] = _plan_lead_ms(row) if row["run_mode"] == "scheduled" else None
         if event == "launch_start" and not dispatch_seen:
             dispatch_seen = True
             report["first_dispatch_ms"] = _number(row.get("release_elapsed_ms"))
@@ -126,6 +144,12 @@ def format_report(report):
             f"首次成功提交响应距本次放号基准：{ms(report['first_accepted_ms'])}",
             f"首次成功提交请求往返：{ms(report['first_accepted_request_ms'])}",
             "上述间隔仅采用 release_elapsed_ms，不从本地时间戳反推；响应成功仍须核对回执。"]
+    plan_lead_ms = report.get("plan_lead_ms")
+    if plan_lead_ms is not None:
+        if plan_lead_ms < 0:
+            text.append(f"生成预约计划时，已过本机计划放号 {-plan_lead_ms / 1000:.3f} 秒")
+        else:
+            text.append(f"生成预约计划时距本机计划放号：{plan_lead_ms / 1000:.3f} 秒")
     for stage, label in PHASES.items():
         values = report["phases"].get(stage)
         if values:
@@ -144,7 +168,12 @@ def format_report(report):
         if values:
             text.append(f"{label}中位：{values['median_ms']:.3f} ms，最大 {values['max_ms']:.3f} ms")
     clock = report["clock"]
-    text.append(f"校时：{clock['status']}；偏移 {ms(clock['offset_ms'])}；余量 {ms(clock['guard_ms'])}")
+    if report["run_mode"] == "scheduled" and clock["status"] == "UNKNOWN":
+        text.append("校时：未记录结果")
+    elif clock["status"] == "CLOCK_UNAVAILABLE":
+        text.append("校时：未通过（CLOCK_UNAVAILABLE）")
+    else:
+        text.append(f"校时：{clock['status']}；偏移 {ms(clock['offset_ms'])}；余量 {ms(clock['guard_ms'])}")
     receipt = report["receipt"]
     label = "回执已匹配" if receipt["outcome"] == "MATCHED" else "回执未知"
     states = {5: "已结束", 6: "待付款", 7: "已生效"}

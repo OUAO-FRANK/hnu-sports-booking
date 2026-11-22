@@ -1,4 +1,5 @@
 """Old launch commands must reach the menu, never start booking implicitly."""
+from contextlib import nullcontext
 from unittest.mock import patch
 import unittest
 
@@ -9,7 +10,8 @@ class CliEntryTests(unittest.TestCase):
     def run_entry(self, args):
         entry = getattr(auto, "cli_main", None)
         self.assertIsNotNone(entry, "CLI must default to the confirmation menu")
-        with patch.object(auto, "main", return_value=0) as book, \
+        with patch.object(auto, "session", nullcontext), \
+             patch.object(auto, "main", return_value=0) as book, \
              patch("booking_menu.main", return_value=0) as menu:
             self.assertEqual(entry(args), 0)
         return book, menu

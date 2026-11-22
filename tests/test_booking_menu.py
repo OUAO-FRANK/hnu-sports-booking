@@ -1,6 +1,6 @@
 """Console choices must be complete and confirmed before running a booking."""
 from datetime import datetime
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import io
 from unittest.mock import Mock, patch
 import unittest
@@ -181,13 +181,15 @@ class MenuTests(unittest.TestCase):
         self.assertIn("编号无效", output)
 
     def test_main_does_not_call_booking_after_cancellation(self):
-        with patch.object(menu, "load_cookie", return_value="fake"), \
+        with patch.object(menu, "session", nullcontext), \
+             patch.object(menu, "load_cookie", return_value="fake"), \
              patch.object(menu, "choose_booking", return_value=None), \
              patch("auto.main", side_effect=AssertionError("must not book")):
             self.assertEqual(menu.main(), 0)
 
     def test_error_after_confirmation_does_not_claim_nothing_was_submitted(self):
-        with patch.object(menu, "load_cookie", return_value="fake"), \
+        with patch.object(menu, "session", nullcontext), \
+             patch.object(menu, "load_cookie", return_value="fake"), \
              patch.object(menu, "choose_booking", return_value=["--now"]), \
              patch("auto.main", side_effect=RuntimeError("unknown after submission")), \
              redirect_stdout(io.StringIO()) as output:

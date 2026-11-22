@@ -15,6 +15,40 @@ def lines(*rows):
 
 
 class RunAnalysisTests(unittest.TestCase):
+    def test_scheduled_plan_lead_and_missing_clock_are_reported_separately(self):
+        report = analyze_run.analyze_lines(lines(
+            {"event": "plan", "run_mode": "scheduled", "time": "2026-01-01T21:59:49.975+08:00",
+             "release_time": "2026-01-01T22:00:00"},
+            {"event": "launch_start", "release_elapsed_ms": 2.2},
+        ))
+        self.assertEqual(report["plan_lead_ms"], 10025.0)
+        self.assertEqual(report["first_dispatch_ms"], 2.2)
+        self.assertEqual(report["clock"]["status"], "UNKNOWN")
+        summary = analyze_run.format_report(report)
+        self.assertIn("生成预约计划时距本机计划放号：10.025 秒", summary)
+        self.assertIn("校时：未记录结果", summary)
+
+    def test_plan_lead_uses_only_complete_scheduled_plan_timestamps(self):
+        valid_plan = {"event": "plan", "run_mode": "scheduled", "time": "2026-01-01T22:00:01+08:00",
+                      "release_time": "2026-01-01T22:00:00"}
+        report = analyze_run.analyze_lines(lines(valid_plan))
+        self.assertEqual(report["plan_lead_ms"], -1000.0)
+        self.assertIn("已过本机计划放号 1.000 秒", analyze_run.format_report(report))
+        for changes in ({"release_time": None}, {"time": "PRIVATE_TIME"},
+                        {"release_time": "2026-01-01"}, {"run_mode": "immediate"}):
+            with self.subTest(changes=changes):
+                invalid = analyze_run.analyze_lines(lines({**valid_plan, **changes}))
+                self.assertIsNone(invalid["plan_lead_ms"])
+                self.assertNotIn("PRIVATE_", json.dumps(invalid) + analyze_run.format_report(invalid))
+
+    def test_clock_failure_is_reported_only_when_recorded(self):
+        report = analyze_run.analyze_lines(lines(
+            {"event": "plan", "run_mode": "scheduled"},
+            {"event": "timing", "stage": "release_clock_ready", "code": "CLOCK_UNAVAILABLE"},
+        ))
+        self.assertEqual(report["clock"]["status"], "CLOCK_UNAVAILABLE")
+        self.assertIn("校时：未通过", analyze_run.format_report(report))
+
     def test_payment_window_exit_reason_is_in_summary(self):
         for reason, outcome, label in (
                 ("USER_CLOSED", "UNCONFIRMED", "用户关闭"),
