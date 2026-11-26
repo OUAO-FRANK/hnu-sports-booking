@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from run_diagnostics import record, session
 
-from auto_grab import BASE, load_cookie
+from auto_grab import BASE, RequestError, load_cookie
+from failure_diagnostics import FAILURE_DETAILS, FAILURE_STAGES
 from booking_catalog import (allowed_dates, china_now, get_calendar, get_halls,
     get_resource_info, parse_times, release_time, selection_limit, validate_selection)
 
@@ -188,11 +189,20 @@ def datetime_start(day, slot):
 def _main() -> int:
     cookie = load_cookie()
     if not cookie:
+        record("failure", stage="login", reason="COOKIE_MISSING")
         print("没有登录凭据，请先运行 python cdp_cookie.py --wait 完成人工登录")
         return 1
     try:
         args = choose_booking(cookie)
+    except RequestError as exc:
+        stage = exc.stage or "selection"
+        reason = exc.failure_reason or "REQUEST_ERROR"
+        record("failure", stage=stage, reason=reason)
+        detail, suggestion = FAILURE_DETAILS[reason]
+        print(f"[×] 未开始预约：{FAILURE_STAGES[stage]}时{detail}。{suggestion}")
+        return 1
     except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+        record("failure", stage="selection", reason="UNKNOWN")
         print(f"[×] 未开始预约：{exc}\n请在 {BASE}/v2/reserve/reserveHall 核对")
         return 1
     except (EOFError, KeyboardInterrupt):

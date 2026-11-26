@@ -12,6 +12,9 @@ from unittest.mock import Mock, patch
 from urllib.error import URLError
 
 import cdp_cookie
+import auto
+import booking_menu
+from auto_grab import RequestError
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -28,6 +31,29 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class LoginStartupTests(unittest.TestCase):
+    def test_login_network_error_does_not_claim_cookie_expired(self):
+        with patch.object(auto, "_req", return_value={"e": "EXC", "m": "SSLError"}), \
+             patch.object(auto, "record") as record, redirect_stdout(io.StringIO()) as output:
+            self.assertIsNone(auto.ensure_login("PRIVATE_COOKIE"))
+        self.assertIn("TLS", output.getvalue())
+        self.assertNotIn("Cookie 失效", output.getvalue())
+        record.assert_called_once_with("failure", stage="login", reason="TLS_ERROR")
+
+    def test_startup_menu_distinguishes_tls_timeout_login_and_rate_limit(self):
+        for response, phrase in (
+            ({"e": "EXC", "m": "SSLError"}, "TLS"),
+            ({"e": "EXC", "m": "ReadTimeoutError"}, "超时"),
+            ({"e": 10042, "m": "PRIVATE_MESSAGE"}, "登录已失效"),
+            ({"e": 429, "m": "PRIVATE_MESSAGE"}, "限流"),
+        ):
+            with self.subTest(response=response), patch.object(booking_menu, "load_cookie", return_value="fake"), \
+                 patch.object(booking_menu, "choose_booking", side_effect=RequestError(response)), \
+                 redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(booking_menu._main(), 1)
+                self.assertIn(phrase, output.getvalue())
+                self.assertNotIn("PRIVATE_", output.getvalue())
+                self.assertNotIn("/v2/reserve/reserveHall 核对", output.getvalue())
+
     def test_local_cdp_never_uses_the_system_http_proxy(self):
         target = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         proxy = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

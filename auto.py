@@ -67,6 +67,7 @@ from booking_catalog import get_resource_info, parse_times, validate_selection  
 from run_diagnostics import record, session  # noqa: E402
 from captcha_prefetch import CaptchaPrefetch  # noqa: E402
 from release_clock import start_release_clock  # noqa: E402
+from failure_diagnostics import classify_failure, FAILURE_DETAILS  # noqa: E402
 
 OUT = HERE / "out"
 BASE = "https://eportal.hnu.edu.cn"
@@ -312,12 +313,14 @@ def ensure_login(cookie: str, verbose: bool = True) -> str | None:
         return cookie
 
     msg = str(r.get("m", ""))
+    code = str(r.get("e"))
+    reason = classify_failure(code, msg if code == "EXC" else None) or "REQUEST_ERROR"
     if verbose:
-        print(f"  Cookie 失效: e={r.get('e')} {msg}")
+        detail, suggestion = FAILURE_DETAILS[reason]
+        print(f"  ✗ 登录检查：{detail}。{suggestion}")
 
-    if not (str(r.get("e")) == "10042" or "登录" in msg):
-        if verbose:
-            print("  ✗ 登录检查失败，请稍后重试")
+    if not (code == "10042" or "登录" in msg):
+        record("failure", stage="login", reason=reason)
         return None
 
     # 尝试自动刷新（需要 CAS 主票据还在）
@@ -330,6 +333,7 @@ def ensure_login(cookie: str, verbose: bool = True) -> str | None:
         if verbose:
             print(f"  自动刷新失败: {exc}")
 
+    record("failure", stage="login", reason=reason)
     if verbose:
         print()
         print("  [!] 需要手动登录一次")
@@ -759,6 +763,7 @@ def main(argv=None) -> int:
     print("[1/4] 检查登录状态")
     cookie = load_cookie()
     if not cookie:
+        record("failure", stage="login", reason="COOKIE_MISSING")
         print("  ✗ 没有 cookie.txt")
         print("    请先运行： python cdp_cookie.py --wait")
         return 1
@@ -771,6 +776,12 @@ def main(argv=None) -> int:
             validate_selection(resource, requested_times, target, now=started_at)
         verify_required = str(resource.get("is_verify")) == "1"
         print(f"  场馆：{resource['name']}；{'需要' if verify_required else '不需要'}点选验证码")
+    except RequestError as exc:
+        reason = exc.failure_reason or "REQUEST_ERROR"
+        record("failure", stage=exc.stage or "venue_rules", reason=reason)
+        detail, suggestion = FAILURE_DETAILS[reason]
+        print(f"[×] 场馆规则检查失败：{detail}。{suggestion}")
+        return 1
     except (RuntimeError, ValueError) as exc:
         print(f"[×] 场馆规则检查失败：{exc}")
         return 1
@@ -851,6 +862,12 @@ def main(argv=None) -> int:
         return 1
     try:
         before = {str(row["id"]) for row in reservation_rows(cookie)}
+    except RequestError as exc:
+        reason = exc.failure_reason or "REQUEST_ERROR"
+        record("failure", stage="reservation_history", reason=reason)
+        detail, suggestion = FAILURE_DETAILS[reason]
+        print(f"[×] 前置检查失败：{detail}。{suggestion}")
+        return 1
     except RuntimeError as exc:
         print(f"[×] 前置检查失败：{exc}")
         return 1
@@ -1358,6 +1375,7 @@ def main(argv=None) -> int:
         print("\n[✓] 服务端确认预约生效" if paid else "\n[!] 未确认预约生效；若已扣款，请在网页核对")
         return 0 if paid else 1
 
+    record("failure", stage="booking", reason="SEARCH_TIMEOUT")
     print("[×] 超时没抢到")
     return 1
 

@@ -6,6 +6,11 @@ import math
 from pathlib import Path
 import sys
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from failure_diagnostics import FAILURE_DETAILS, FAILURE_STAGES, READ_STAGES, classify_failure
+
 PHASES = {"query": "查场", "captcha_get": "验证码取图", "captcha_infer": "识别",
           "captcha_verify": "验证码校验", "captcha": "验证码全流程", "launch": "提交"}
 REASONS = ("ACCEPTED", "UNCERTAIN", "NOT_RELEASED", "UNAVAILABLE", "REJECTED", "UNKNOWN")
@@ -58,11 +63,15 @@ def analyze_lines(lines):
               "first_submission_connection": dict.fromkeys(("connection_reused", *CONNECTION_METRICS)),
               "clock": {"status": "UNKNOWN", "offset_ms": None, "guard_ms": None},
               "receipt": {"outcome": "UNKNOWN", "status": None},
-              "payment_ui": {"reason": "UNKNOWN", "outcome": "UNKNOWN"}, "malformed_lines": 0}
+              "payment_ui": {"reason": "UNKNOWN", "outcome": "UNKNOWN"},
+              "failure_stage": None, "failure_reason": None, "suggestion": None,
+              "http_error_counts": {}, "malformed_lines": 0}
     phases = {stage: [] for stage in PHASES}
     connection_values = {key: [] for key in CONNECTION_METRICS}
     http_count = reuse_samples = reused = 0
     dispatch_seen = accepted_seen = connection_seen = False
+    exit_code = None
+    terminal_failure = last_http_failure = None
     for line in lines:
         if not line.strip():
             continue
@@ -74,6 +83,13 @@ def analyze_lines(lines):
             report["malformed_lines"] += 1
             continue
         event, stage = row.get("event"), row.get("stage")
+        if event == "result" and type(row.get("exit_code")) is int:
+            exit_code = row["exit_code"]
+        if event == "failure":
+            reason = row.get("reason")
+            if (isinstance(stage, str) and stage in FAILURE_STAGES
+                    and isinstance(reason, str) and reason in FAILURE_DETAILS):
+                terminal_failure = (stage, reason)
         if event == "plan" and row.get("run_mode") in ("scheduled", "immediate", "dry_run"):
             report["run_mode"] = row["run_mode"]
             report["plan_lead_ms"] = _plan_lead_ms(row) if row["run_mode"] == "scheduled" else None
@@ -108,6 +124,14 @@ def analyze_lines(lines):
                 report["payment_ui"] = {"reason": reason, "outcome": row["outcome"]}
         if event == "http":
             http_count += 1
+            request_error = classify_failure(row.get("status"), row.get("error_type"))
+            counts = report["http_error_counts"]
+            if request_error:
+                counts[request_error] = counts.get(request_error, 0) + 1
+            path = row.get("path")
+            read_stage = READ_STAGES.get(path) if isinstance(path, str) else None
+            last_http_failure = ((read_stage, request_error)
+                                 if read_stage and request_error and row.get("method") == "GET" else None)
             first_submission = not connection_seen and row.get("path") == "/site/reservation/launch"
             if first_submission:
                 connection_seen = True
@@ -122,6 +146,9 @@ def analyze_lines(lines):
                     connection_values[key].append(value)
                     if first_submission:
                         report["first_submission_connection"][key] = value
+    if exit_code not in (None, 0) and not accepted_seen and report["receipt"]["outcome"] != "MATCHED":
+        stage, reason = terminal_failure or last_http_failure or (None, "UNKNOWN")
+        report.update(failure_stage=stage, failure_reason=reason, suggestion=FAILURE_DETAILS[reason][1])
     report["phases"] = {stage: _summary(values) for stage, values in phases.items() if values}
     report["connections"] = {"requests": http_count, "reuse_samples": reuse_samples, "reused": reused,
                              "reuse_percent": round(reused / reuse_samples * 100, 1) if reuse_samples else None,
@@ -150,6 +177,13 @@ def format_report(report):
             text.append(f"生成预约计划时，已过本机计划放号 {-plan_lead_ms / 1000:.3f} 秒")
         else:
             text.append(f"生成预约计划时距本机计划放号：{plan_lead_ms / 1000:.3f} 秒")
+    if reason := report.get("failure_reason"):
+        text.append(f"失败阶段：{FAILURE_STAGES.get(report.get('failure_stage'), '未确认')}")
+        text.append(f"失败原因：{FAILURE_DETAILS[reason][0]}")
+        text.append(f"建议：{report['suggestion']}")
+    if errors := report.get("http_error_counts"):
+        text.append("运行中 HTTP 异常：" + "，".join(
+            f"{FAILURE_DETAILS[reason][0]} {count} 次" for reason, count in errors.items()))
     for stage, label in PHASES.items():
         values = report["phases"].get(stage)
         if values:

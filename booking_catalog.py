@@ -33,7 +33,7 @@ def parse_times(value: str) -> list[str]:
 
 def get_halls(cookie: str) -> list[dict]:
     response = _req("/site/reservation/hall", cookie=cookie)
-    require_success(response)
+    require_success(response, stage="hall")
     halls = response.get("d")
     if not isinstance(halls, list) or any(not isinstance(h.get("resources"), list) for h in halls):
         raise RuntimeError("预约大厅结构不认识，请在网页查看")
@@ -42,7 +42,7 @@ def get_halls(cookie: str) -> list[dict]:
 
 def get_resource_info(cookie: str, venue: int) -> dict:
     response = _req("/site/reservation/resource-info", params={"resource_id": venue}, cookie=cookie)
-    require_success(response)
+    require_success(response, stage="venue_rules")
     info = response.get("d")
     advanced = (info.get("json_advanced_rule") or {}) if isinstance(info, dict) else {}
     related = advanced.get("rule") or {}
@@ -62,7 +62,7 @@ def get_resource_info(cookie: str, venue: int) -> dict:
 def get_calendar(cookie: str, venue: int, day: str) -> list[dict]:
     response = _req("/site/reservation/resource-info-margin", cookie=cookie,
                     params={"resource_id": venue, "start_time": day, "end_time": day})
-    require_success(response)
+    require_success(response, stage="calendar")
     slots = parse_margin(response, include_unavailable=True)
     if slots is None:
         raise RuntimeError("目标日期的排期结构不认识")

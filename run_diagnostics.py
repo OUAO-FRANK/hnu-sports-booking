@@ -96,7 +96,7 @@ def session(directory=None):
             try:
                 from tools.analyze_run import analyze_file, format_report
                 report = analyze_file(log.path)
-                if report["run_mode"] != "UNKNOWN":
+                if report["run_mode"] != "UNKNOWN" or report.get("failure_reason") is not None:
                     summary = log.path.with_suffix(".summary.json")
                     summary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                     print(format_report(report))

@@ -61,6 +61,7 @@ class LiveProfilerTests(unittest.TestCase):
     def test_query_profile_has_no_model_or_captcha_calls(self):
         result = self.run_profile()
         self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["login_status"], "valid")
         self.assertEqual(len(result["rounds"]), 1)
         self.assertFalse(any("captcha" in path for path in self.paths))
 
@@ -77,8 +78,19 @@ class LiveProfilerTests(unittest.TestCase):
         self.transport.request_json.side_effect = None
         result = self.run_profile(captcha=True)
         self.assertEqual(result["status"], "login_required")
+        self.assertEqual(result["login_status"], "login_required")
+        self.assertEqual(result["failure_stage"], "login")
         self.assertEqual(self.transport.request_json.call_count, 1)
         self.assertNotIn("PRIVATE_", json.dumps(result))
+
+    def test_tls_failure_leaves_login_unverified_in_read_only_report(self):
+        self.transport.request_json.side_effect = None
+        self.transport.request_json.return_value = {"e": "EXC", "m": "SSLError"}
+        result = self.run_profile()
+        self.assertEqual(result["login_status"], "unverified")
+        self.assertEqual(result["failure_reason"], "TLS_ERROR")
+        self.assertEqual(result["failure_stage"], "login")
+        self.transport.request_json.assert_called_once()
 
     def test_rate_limit_stops_the_remaining_samples(self):
         original = self.api
@@ -90,6 +102,8 @@ class LiveProfilerTests(unittest.TestCase):
         result = self.run_profile(captcha=True)
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(result["code"], "429")
+        self.assertEqual(result["login_status"], "valid")
+        self.assertEqual(result["failure_stage"], "calendar")
         self.assertEqual(result["rounds"], [])
 
     def test_failed_verification_is_not_reported_as_a_successful_fast_round(self):

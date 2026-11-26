@@ -37,6 +37,7 @@ sys.path.insert(0, str(HERE / "tools"))
 
 from captcha_solver import aes_ecb_encrypt_b64  # noqa: E402
 from captcha_v4 import solve as solve_captcha  # noqa: E402
+from failure_diagnostics import classify_failure  # noqa: E402
 from shape_adapter import parse_margin  # noqa: E402
 from http_transport import get_transport  # noqa: E402
 from run_diagnostics import record  # noqa: E402
@@ -83,18 +84,20 @@ def load_cookie() -> str:
 
 # --------------------------------------------------------------------------- #
 class RequestError(RuntimeError):
-    def __init__(self, response: dict):
+    def __init__(self, response: dict, *, stage=None):
         value = response.get("e")
         self.code = str(value) if type(value) in (int, str) else "SHAPE"
+        self.stage = stage
+        self.failure_reason = classify_failure(self.code, response.get("m") if self.code == "EXC" else None)
         self.retryable = self.code in ("EXC", "408", "429", "500", "502", "503", "504")
         message = ("登录已失效，请运行 python cdp_cookie.py --wait"
                    if self.code in ("10042", "10043") else str(response.get("m") or "接口响应结构异常"))
         super().__init__(f"e={self.code}: {message}")
 
 
-def require_success(response: dict) -> None:
+def require_success(response: dict, *, stage=None) -> None:
     if type(response.get("e")) not in (int, str) or response.get("e") not in (0, "0"):
-        raise RequestError(response)
+        raise RequestError(response, stage=stage)
 
 
 def fetch_slots(cookie: str, venue: int, date: str) -> list[dict]:

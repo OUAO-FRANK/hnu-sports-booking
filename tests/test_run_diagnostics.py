@@ -70,6 +70,15 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_", raw)
         self.assertEqual(json.loads(raw)["first_accepted_ms"], 1234.5)
 
+    def test_preflight_failure_produces_auto_summary_without_a_booking_plan(self):
+        with self.module.session(self.folder) as log:
+            self.module.record("failure", stage="hall", reason="TLS_ERROR")
+            self.module.record("result", exit_code=1)
+        report = json.loads(log.path.with_suffix(".summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["run_mode"], "UNKNOWN")
+        self.assertEqual(report["failure_stage"], "hall")
+        self.assertEqual(report["failure_reason"], "TLS_ERROR")
+
     def test_summary_read_failure_does_not_break_a_completed_session(self):
         with patch("tools.analyze_run.analyze_file", side_effect=RuntimeError("PRIVATE_ERROR")):
             with self.module.session(self.folder) as log:

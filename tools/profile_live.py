@@ -17,6 +17,7 @@ from booking_catalog import china_now
 from captcha_engine import CaptchaEngine
 from captcha_prefetch import CaptchaPrefetch
 from captcha_solver import aes_ecb_encrypt_b64
+from failure_diagnostics import FAILURE_DETAILS, READ_STAGES
 from http_transport import HttpTransport
 from run_diagnostics import session
 from shape_adapter import parse_margin
@@ -44,7 +45,7 @@ class LiveProbe:
             data = urlencode(form).encode()
         result = self.transport.request_json(url, headers=headers, data=data, timeout=5)
         if path != CHECK or str(result.get("e")) in ("10042", "10043", "EXC", "429", "500", "502", "503", "504"):
-            require_success(result)
+            require_success(result, stage=READ_STAGES.get(path))
         return result
 
 
@@ -63,9 +64,11 @@ def profile(probe, *, venue, day, samples=3, captcha=False):
     if not 1 <= samples <= 3:
         raise ValueError("Use 1-3 samples per mode")
     report = {"scope": "real queries and optional captcha verification; no booking or payment",
-              "venue": venue, "date": day, "rounds": [], "booking_requests": 0, "payment_requests": 0}
+              "venue": venue, "date": day, "rounds": [], "booking_requests": 0, "payment_requests": 0,
+              "login_status": "unverified"}
     try:
         _, report["login_ms"] = timed(lambda: probe.call("/site/user/get-name"))
+        report["login_status"] = "valid"
         info, report["resource_ms"] = timed(lambda: probe.call(
             "/site/reservation/resource-info", params={"resource_id": venue}))
         use_captcha = captcha and str(info.get("d", {}).get("is_verify")) == "1"
@@ -126,8 +129,12 @@ def profile(probe, *, venue, day, samples=3, captcha=False):
                 report["median_verified_total_ms"][mode] = round(statistics.median(successful), 1) if successful else None
         report["status"] = "ok"
     except RequestError as exc:
-        report.update(status="login_required" if exc.code in ("10042", "10043") else "stopped",
-                      code=safe_code(exc.code))
+        reason = exc.failure_reason or "REQUEST_ERROR"
+        status = "login_required" if reason == "LOGIN_REQUIRED" else "stopped"
+        if status == "login_required":
+            report["login_status"] = status
+        report.update(status=status, code=safe_code(exc.code), failure_stage=exc.stage,
+                      failure_reason=reason, suggestion=FAILURE_DETAILS[reason][1])
     except Exception as exc:
         report.update(status="stopped", error_type=type(exc).__name__)
     return report
