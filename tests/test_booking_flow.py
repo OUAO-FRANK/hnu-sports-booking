@@ -103,11 +103,22 @@ class FlowTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
 
     def test_login_expiry_10043_stops_without_trying_another_court(self):
-        code, calls, _, _ = self.run_flow(datetime(2026, 10, 29, 22),
-            fetch=lambda *args: [dict(SLOT), dict(SLOT, court="Court 2", sub=3)],
-            responses=[{"e": 10043}, {"e": 0, "d": {"id": 101}}])
+        with patch.object(auto, "record") as diagnostics:
+            code, calls, _, _ = self.run_flow(datetime(2026, 10, 29, 22),
+                fetch=lambda *args: [dict(SLOT), dict(SLOT, court="Court 2", sub=3)],
+                responses=[{"e": 10043}, {"e": 0, "d": {"id": 101}}])
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 1)
+        diagnostics.assert_any_call("failure", stage="booking", reason="LOGIN_REQUIRED")
+
+    def test_calendar_login_failure_records_where_execution_stopped(self):
+        for kwargs in ({"warm_response": {"e": 10042}},
+                       {"fetch": Mock(side_effect=auto.RequestError({"e": 10043}))}):
+            with self.subTest(source=next(iter(kwargs))), patch.object(auto, "record") as diagnostics:
+                code, calls, _, _ = self.run_flow(datetime(2026, 10, 29, 21, 59, 40), **kwargs)
+                self.assertEqual(code, 1)
+                self.assertEqual(calls, [])
+                diagnostics.assert_any_call("failure", stage="calendar", reason="LOGIN_REQUIRED")
 
     def test_ambiguous_response_with_matching_two_period_receipt_is_not_repeated(self):
         periods = ["19:10-20:10", "20:10-21:10"]

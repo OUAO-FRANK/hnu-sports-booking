@@ -958,6 +958,7 @@ def main(argv=None) -> int:
                                                 **clock_args)
         except RequestError as exc:
             preparation_stopped.set()
+            record("failure", stage="calendar", reason=exc.failure_reason or "REQUEST_ERROR")
             print(f"[×] 放号前登录检查失败：{exc}")
             return 1
         except BaseException:
@@ -1059,6 +1060,7 @@ def main(argv=None) -> int:
         except RequestError as exc:
             print(f"  [!] 查询失败：{exc}")
             if not exc.retryable:
+                record("failure", stage="calendar", reason=exc.failure_reason or "REQUEST_ERROR")
                 return 1
             time.sleep(1.0)
             continue
@@ -1213,6 +1215,9 @@ def main(argv=None) -> int:
                             print("[×] 提交结果不明，停止重复提交；请在网页核对预约记录")
                             return 1
                     elif fatal_refusal:
+                        failure_reason = classify_failure(e)
+                        if failure_reason:
+                            record("failure", stage="booking", reason=failure_reason)
                         print("[×] 无法继续预约，请处理上述原因后重试")
                         return 1
                     else:

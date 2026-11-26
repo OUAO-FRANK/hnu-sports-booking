@@ -46,6 +46,15 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertEqual(report["failure_reason"], "UNKNOWN")
         self.assertEqual(report["http_error_counts"], {"TLS_ERROR": 1})
 
+    def test_legacy_http_error_does_not_explain_a_post_plan_failure(self):
+        report = analyze_run.analyze_lines(lines(
+            {"event": "http", "path": "/site/reservation/hall", "method": "GET", "error_type": "SSLError"},
+            {"event": "plan", "run_mode": "scheduled"},
+            {"event": "result", "exit_code": 1},
+        ))
+        self.assertEqual(report["failure_reason"], "UNKNOWN")
+        self.assertEqual(report["http_error_counts"], {"TLS_ERROR": 1})
+
     def test_explicit_failure_uses_only_allowlisted_stage_and_reason(self):
         report = analyze_run.analyze_lines(lines(
             {"event": "failure", "stage": "login", "reason": "LOGIN_REQUIRED", "suggestion": "PRIVATE_HINT"},

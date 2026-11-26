@@ -147,7 +147,8 @@ def analyze_lines(lines):
                     if first_submission:
                         report["first_submission_connection"][key] = value
     if exit_code not in (None, 0) and not accepted_seen and report["receipt"]["outcome"] != "MATCHED":
-        stage, reason = terminal_failure or last_http_failure or (None, "UNKNOWN")
+        startup_failure = last_http_failure if report["run_mode"] == "UNKNOWN" else None
+        stage, reason = terminal_failure or startup_failure or (None, "UNKNOWN")
         report.update(failure_stage=stage, failure_reason=reason, suggestion=FAILURE_DETAILS[reason][1])
     report["phases"] = {stage: _summary(values) for stage, values in phases.items() if values}
     report["connections"] = {"requests": http_count, "reuse_samples": reuse_samples, "reused": reused,
